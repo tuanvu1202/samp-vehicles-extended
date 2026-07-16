@@ -1,0 +1,37 @@
+name: Build VehiclesExtended
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: windows-2025
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Configure Win32
+        run: >
+          cmake
+          -S .
+          -B build
+          -G "Visual Studio 17 2022"
+          -A Win32
+
+      - name: Build Release
+        run: cmake --build build --config Release
+
+      - name: Show output
+        shell: powershell
+        run: Get-ChildItem -Path build -Recurse -Filter *.asi
+
+      - name: Upload ASI
+        uses: actions/upload-artifact@v4
+        with:
+          name: VehiclesExtended-x86
+          path: build/Release/VehiclesExtended.asi
+          if-no-files-found: error

@@ -1,265 +1,267 @@
 #include <windows.h>
 #include <cstdint>
-#include <cstring>
+#include <cstddef>
 #include <cstdio>
 #include <cstdarg>
+#include <cstring>
 
-//#define DEBUG
-
-HMODULE samp_dll = nullptr;
-
-
-void Log(const char* fmt, ...)
+namespace
 {
-    va_list args;
-    va_start(args, fmt);
-    vprintf(fmt, args);
-    printf("\n");
-    va_end(args);
-}
+    HMODULE g_sampDll = nullptr;
 
-uint8_t* FindPattern(
-    uint8_t* base,
-    size_t size,
-    const uint8_t* pattern,
-    const char* mask)
-{
-    size_t patternLen = strlen(mask);
-
-    for (size_t i = 0; i <= size - patternLen; ++i)
+    void Log(const char* format, ...)
     {
-        bool found = true;
+        char message[1024]{};
 
-        for (size_t j = 0; j < patternLen; ++j)
+        va_list args;
+        va_start(args, format);
+        std::vsnprintf(message, sizeof(message), format, args);
+        va_end(args);
+
+        OutputDebugStringA(message);
+        OutputDebugStringA("\n");
+
+        FILE* file = nullptr;
+        if (fopen_s(&file, "VehiclesExtended.log", "a") == 0 && file)
         {
-            if (mask[j] == 'x' && base[i + j] != pattern[j])
+            std::fprintf(file, "%s\n", message);
+            std::fclose(file);
+        }
+    }
+
+    bool GetTextSection(HMODULE module, std::uint8_t*& textBase, std::size_t& textSize)
+    {
+        textBase = nullptr;
+        textSize = 0;
+
+        if (!module)
+            return false;
+
+        auto* moduleBase = reinterpret_cast<std::uint8_t*>(module);
+        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(moduleBase);
+
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0)
+        {
+            Log("Invalid DOS header in samp.dll");
+            return false;
+        }
+
+        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(moduleBase + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE)
+        {
+            Log("Invalid PE header in samp.dll");
+            return false;
+        }
+
+        if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC)
+        {
+            Log("Unsupported samp.dll architecture; expected 32-bit");
+            return false;
+        }
+
+        const std::size_t imageSize = nt->OptionalHeader.SizeOfImage;
+        auto* sections = IMAGE_FIRST_SECTION(nt);
+
+        for (unsigned int index = 0; index < nt->FileHeader.NumberOfSections; ++index)
+        {
+            if (std::memcmp(sections[index].Name, ".text", 5) != 0)
+                continue;
+
+            const std::size_t virtualAddress = sections[index].VirtualAddress;
+            const std::size_t virtualSize = sections[index].Misc.VirtualSize;
+
+            if (virtualSize == 0 || virtualAddress >= imageSize || virtualSize > imageSize - virtualAddress)
             {
-                found = false;
-                break;
+                Log("Invalid .text section boundaries");
+                return false;
             }
+
+            textBase = moduleBase + virtualAddress;
+            textSize = virtualSize;
+            return true;
         }
 
-        if (found)
-            return base + i;
+        Log(".text section not found in samp.dll");
+        return false;
     }
 
-    return nullptr;
-}
-
-
-void PatchVehicleIdLimit()
-{
-
-    Log("SAMP Vehicle ID patch");
-
-    uint8_t* moduleBase = reinterpret_cast<uint8_t*>(samp_dll);
-
-    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(moduleBase);
-    auto* nt  = reinterpret_cast<IMAGE_NT_HEADERS*>(moduleBase + dos->e_lfanew);
-
-    IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt);
-
-    uint8_t* textBase = nullptr;
-    size_t textSize = 0;
-
-    for(int i = 0; i < nt->FileHeader.NumberOfSections; i++)
+    const std::uint8_t* FindUniquePattern(
+        const std::uint8_t* base,
+        std::size_t size,
+        const std::uint8_t* pattern,
+        std::size_t patternSize,
+        const char* mask,
+        std::size_t& matchCount)
     {
-        if(memcmp(section[i].Name, ".text", 5) == 0)
+        matchCount = 0;
+
+        if (!base || !pattern || !mask || patternSize == 0)
+            return nullptr;
+
+        if (std::strlen(mask) != patternSize)
         {
-            textBase = moduleBase + section[i].VirtualAddress;
-            textSize = section[i].Misc.VirtualSize;
-            break;
+            Log("Internal error: pattern and mask lengths do not match");
+            return nullptr;
         }
-    }
 
-    if(textBase == nullptr || textSize == 0)
-    {
-        Log(".text section not found");
-        return;
-    }
+        if (size < patternSize)
+            return nullptr;
 
-    Log("[+] .text section at 0x%p (size: 0x%X)", textBase, (unsigned)textSize);
+        const std::uint8_t* firstMatch = nullptr;
 
-
-    uint8_t pattern[] = {
-        0x3D, 0x90, 0x01, 0x00, 0x00,
-        0x0F, 0x8C, 0x00, 0x00, 0x00, 0x00,
-        0x3D, 0x63, 0x02, 0x00, 0x00,
-        0x0F, 0x8F, 0x00, 0x00, 0x00, 0x00
-    };
-
-    const char* mask = "xxxxxx????xxxxx????";
-
-    uint8_t* match = FindPattern(textBase, textSize, pattern, mask);
-    if (!match)
-    {
-        Log("instruction pattern not found");
-        return;
-    }
-
-    Log("[+] Pattern found at 0x%p", match);
-
-    uint8_t* jgInstruction = match + 16;
-
-    Log("[+] 'jg' instruction at 0x%p", jgInstruction);
-    Log("[+] Bytes before patch: %02X %02X %02X %02X %02X %02X",
-        jgInstruction[0], jgInstruction[1], jgInstruction[2],
-        jgInstruction[3], jgInstruction[4], jgInstruction[5]);
-
-    if (jgInstruction[0] != 0x0F || jgInstruction[1] != 0x8F)
-    {
-        Log("instruction mismatch, aborting patch");
-        return;
-    }
-
-    DWORD oldProtect;
-
-    if(!VirtualProtect(jgInstruction, 6, PAGE_EXECUTE_READWRITE, &oldProtect))
-    {
-        Log("VirtualProtect failed, cannot patch instruction");
-        return;
-    }
-
-    for(int i = 0; i < 6; i++)
-    {
-        jgInstruction[i] = 0x90;
-    }
-
-    VirtualProtect(jgInstruction, 6, oldProtect, &oldProtect);
-
-    Log("Patch applied succesfully");
-
-    Log("Bytes after patch: %02X %02X %02X %02X %02X %02X",
-        jgInstruction[0], jgInstruction[1], jgInstruction[2],
-        jgInstruction[3], jgInstruction[4], jgInstruction[5]);
-
-}
-
-void PatchSaa()
-{
-    Log("Patching samp.dll to avoid overwriting .dat and .cfg files");
-    uint8_t* moduleBase = reinterpret_cast<uint8_t*>(samp_dll);
-
-    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(moduleBase);
-    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(moduleBase+ dos->e_lfanew);
-
-    IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt);
-
-    uint8_t* textBase = nullptr;
-    size_t textSize = 0;
-
-    for(int i = 0; i < nt->FileHeader.NumberOfSections; i++)
-    {
-        if(memcmp(section[i].Name, ".text", 5) == 0)
+        for (std::size_t offset = 0; offset <= size - patternSize; ++offset)
         {
-            textBase = moduleBase + section[i].VirtualAddress;
-            textSize = section[i].Misc.VirtualSize;
-            break;
+            bool matched = true;
+
+            for (std::size_t index = 0; index < patternSize; ++index)
+            {
+                if (mask[index] == 'x' && base[offset + index] != pattern[index])
+                {
+                    matched = false;
+                    break;
+                }
+            }
+
+            if (!matched)
+                continue;
+
+            if (!firstMatch)
+                firstMatch = base + offset;
+
+            ++matchCount;
         }
+
+        return firstMatch;
     }
 
-    const uint8_t pattern[] = 
+    bool PatchVehicleIdLimit()
     {
-        0x83, 
-        0xC4, 
-        0x04, 
-        0x50, 
-        0xFF, 
-        0x57, 
-        0x0C, 
-        0x83, 
-        0xF8, 
-        0xFF, 
-        0x74, 
-        0x66, 
-        0x50, 
-        0xE8, 
-        0x6C, 
-        0xFA, 
-        0xFF, 
-        0xFF, 
-        0x56, 
-        0x8B, 
-        0xF8, 
-        0xE8, 
-        0x04, 
-        0xFE, 
-        0xFF, 
-        0xFF, 
-        0x83, 
-        0xC4, 
-        0x08, 
-        0x8D
-    };
-    static const char mask[] = "xxxxxxxxxx?xx????xxxx????xxxx";
+        std::uint8_t* textBase = nullptr;
+        std::size_t textSize = 0;
 
+        if (!GetTextSection(g_sampDll, textBase, textSize))
+            return false;
 
-    uint8_t* match_point = FindPattern(textBase, textSize, pattern, mask);
+        // cmp eax, 400 / jl ... / cmp eax, 611 / jg ...
+        // Relative jump offsets are wildcarded because they differ between SA-MP builds.
+        static constexpr std::uint8_t pattern[] = {
+            0x3D, 0x90, 0x01, 0x00, 0x00,
+            0x0F, 0x8C, 0x00, 0x00, 0x00, 0x00,
+            0x3D, 0x63, 0x02, 0x00, 0x00,
+            0x0F, 0x8F, 0x00, 0x00, 0x00, 0x00
+        };
 
-    if(!match_point)
-    {
-        Log(".saa patch: Pattern not found");
-        return;
-    }
+        static constexpr char mask[] = "xxxxxxx????xxxxxxx????";
+        static_assert(sizeof(pattern) == sizeof(mask) - 1, "Pattern/mask length mismatch");
 
-    Log(".saa patch: Pattern found at 0x%p", match_point);
+        std::size_t matchCount = 0;
+        const std::uint8_t* match = FindUniquePattern(
+            textBase,
+            textSize,
+            pattern,
+            sizeof(pattern),
+            mask,
+            matchCount);
 
-
-    uint8_t* theInstruction = match_point + 10;
-
-    if(theInstruction[0] != 0x74)
-    {
-        Log(".saa patch: Instruction mismatch, aborting");
-        return;
-    }
-
-    DWORD oldProtect;
-
-    if(!VirtualProtect(theInstruction, 1, PAGE_EXECUTE_READWRITE, &oldProtect))
-    {
-        Log(".saa patch: VirtualProtect failed!");
-        return;
-    }
-    theInstruction[0] = 0xEB;
-
-    VirtualProtect(theInstruction, 1, oldProtect, &oldProtect);
-
-    Log("Patch applied succesfully!");
-    Log("Byte after patch: %02X", theInstruction[0]);
-}
-
-
-DWORD WINAPI PatchThread(LPVOID)
-{
-    #ifdef DEBUG
-    AllocConsole();
-    freopen("CONOUT$", "w", stdout);
-    freopen("CONOUT$", "w", stderr);
-    SetConsoleTitleA("SA-MP Debug Console");
-    Log("Console initialized");
-    #endif
-
-
-    Sleep(100);
-    PatchSaa();
-
-    Sleep(100);
-    PatchVehicleIdLimit();
-    
-    return 0;
-}
-
-
-BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID)
-{
-    samp_dll = GetModuleHandleA("samp.dll");
-    if(samp_dll)
-    {
-        if (reason == DLL_PROCESS_ATTACH)
+        if (!match || matchCount == 0)
         {
-            DisableThreadLibraryCalls(hinst);
-            CreateThread(nullptr, 0, PatchThread, nullptr, 0, nullptr);
+            Log("Vehicle ID signature not found; no patch was applied");
+            return false;
         }
+
+        if (matchCount != 1)
+        {
+            Log("Vehicle ID signature is ambiguous (%zu matches); patch aborted safely", matchCount);
+            return false;
+        }
+
+        auto* jgInstruction = const_cast<std::uint8_t*>(match + 16);
+
+        if (jgInstruction < textBase || jgInstruction + 6 > textBase + textSize)
+        {
+            Log("Patch address is outside the .text section; patch aborted safely");
+            return false;
+        }
+
+        if (jgInstruction[0] != 0x0F || jgInstruction[1] != 0x8F)
+        {
+            Log("Expected JG instruction was not found; patch aborted safely");
+            return false;
+        }
+
+        DWORD oldProtection = 0;
+        if (!VirtualProtect(jgInstruction, 6, PAGE_EXECUTE_READWRITE, &oldProtection))
+        {
+            Log("VirtualProtect failed with error %lu", GetLastError());
+            return false;
+        }
+
+        std::memset(jgInstruction, 0x90, 6);
+        FlushInstructionCache(GetCurrentProcess(), jgInstruction, 6);
+
+        DWORD ignoredProtection = 0;
+        VirtualProtect(jgInstruction, 6, oldProtection, &ignoredProtection);
+
+        Log("Vehicle ID limit patch applied successfully");
+        return true;
     }
+
+    void RunPatchSafely()
+    {
+        DeleteFileA("VehiclesExtended.log");
+        Log("VehiclesExtended safe build started");
+
+        // ASI plugins may be loaded before samp.dll. Wait instead of patching too early.
+        for (int attempt = 0; attempt < 300; ++attempt)
+        {
+            g_sampDll = GetModuleHandleA("samp.dll");
+            if (g_sampDll)
+                break;
+
+            Sleep(100);
+        }
+
+        if (!g_sampDll)
+        {
+            Log("samp.dll was not loaded within 30 seconds; plugin stopped safely");
+            return;
+        }
+
+        // Give SA-MP a little extra time to finish its initialization.
+        Sleep(1500);
+        PatchVehicleIdLimit();
+    }
+
+    DWORD WINAPI PatchThread(LPVOID)
+    {
+#ifdef _MSC_VER
+        __try
+        {
+            RunPatchSafely();
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            Log(
+                "An internal exception was caught (code 0x%08lX); game execution continues",
+                GetExceptionCode());
+        }
+#else
+        RunPatchSafely();
+#endif
+        return 0;
+    }
+}
+
+BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID)
+{
+    if (reason == DLL_PROCESS_ATTACH)
+    {
+        DisableThreadLibraryCalls(instance);
+
+        HANDLE thread = CreateThread(nullptr, 0, PatchThread, nullptr, 0, nullptr);
+        if (thread)
+            CloseHandle(thread);
+    }
+
     return TRUE;
 }
